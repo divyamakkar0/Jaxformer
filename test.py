@@ -3,7 +3,7 @@ import jax.numpy as jnp
 from functools import partial
 from jax.sharding import PartitionSpec as P
 import numpy as np
-from test2 import Transformer
+from test2 import ModelConfig, shardedModel
 from dataset import Dataset
 from utils import dataConfig
 import time
@@ -13,10 +13,12 @@ VOCAB_SIZE = 100277
 BLOCKS = 2
 LAYERS_PER_BLOCK = 5
 NUM_HEADS = 2
-DATA_PARALLEL = 32
+DATA_PARALLEL = 16
+LAYER_PARALLEL = 2
 SEQ_LEN = 1024
 DROPOUT_RATE = 0.1
-DATA_FACTOR = 20
+BATCH_SIZE = 20
+MICRO_BATCH_SIZE = 4
 LATENT_DIM = 64
 DHR = 64
 MODEL_DTYPE=jnp.bfloat16
@@ -32,11 +34,14 @@ if jax.process_index() == 0:
             f"Coords: {d.coords}, Core: {d.core_on_chip}"
         )
 
-mesh = jax.make_mesh((DATA_PARALLEL,), ('dp',))
+assert devices.shape == (DATA_PARALLEL * LAYER_PARALLEL,), \
+    f"Expected {DATA_PARALLEL * LAYER_PARALLEL} devices, got {devices.shape[0]}"
+
+mesh = jax.make_mesh((DATA_PARALLEL, LAYER_PARALLEL), ('dp', 'pp'))
 
 data_partition = jax.sharding.NamedSharding(
     mesh,
-    P(None, 'dp', None, None, None),
+    P(None, 'dp', 'pp', None, None),
 )
 
 data_cfg = dataConfig(
@@ -44,10 +49,10 @@ data_cfg = dataConfig(
     process_path="./bucket_downloads/processShard",
     train_folder_name="train",
     val_folder_name="val",
-    train_batch_size=DATA_PARALLEL * DATA_FACTOR,
+    train_batch_size=DATA_PARALLEL * BATCH_SIZE,
     T=SEQ_LEN,
-    val_batch_size=DATA_PARALLEL * DATA_FACTOR,
-    micro_batch_size=1,
+    val_batch_size=DATA_PARALLEL * BATCH_SIZE,
+    micro_batch_size=MICRO_BATCH_SIZE,
 )
 
 train_dataset, val_dataset = Dataset.getDataset(
@@ -56,7 +61,7 @@ train_dataset, val_dataset = Dataset.getDataset(
     dp=DATA_PARALLEL,
 )
 
-model = Transformer(
+modelCfg = ModelConfig(
     model_dimension=MODEL_DIM,
     vocab_size=VOCAB_SIZE,
     n_head=NUM_HEADS,
@@ -69,33 +74,25 @@ model = Transformer(
     model_dtype=MODEL_DTYPE,
 )
 
-@jax.jit
-@partial(
-        jax.shard_map,
-        mesh=mesh,
-        in_specs=(P('dp')),
-        out_specs=P(),
-)
-def init_weights(x):
-    params = model.init(jax.random.PRNGKey(1), x, train=False)['params']
-    sharding = jax.NamedSharding(mesh, P())
-    params = jax.tree.map(
-        lambda x: jax.device_put(x, sharding),
-        params,
-    )
-    return params
+model = shardedModel(modelCfg)
 
-x_init = jnp.ones((32, 1, SEQ_LEN), dtype=jnp.int32)
-params = init_weights(x_init)
+print("creating sharded model ...")
+params = model.init_weights(jax.random.PRNGKey(0), mesh)
 param_count = jax.tree.reduce(
     lambda x, y: x + y.size,
     params,
     0,
 )
+print(f"Total parameters: {param_count:,}")
 
 def step(params, x, y, key, train=True):
     def loss_fn(params, x, y, key):
-        logits, _ = model.apply({'params': params}, x, rngs={"dropout": key})
+        logits, _ = model.pipe_step(
+            params,
+            x,
+            key=key,
+            train=train,
+        )
         log_probs = jax.nn.log_softmax(logits, axis=-1)
 
         M, B, T, V = logits.shape
@@ -131,8 +128,9 @@ eval_step = jax.jit(
     ),
 )
 
+
 MAX_STEPS = 10
-total_tokens = DATA_FACTOR * DATA_PARALLEL * SEQ_LEN
+total_tokens = BATCH_SIZE * DATA_PARALLEL * SEQ_LEN
 lr = 4e-3
 
 jax.experimental.multihost_utils.sync_global_devices('sync')
